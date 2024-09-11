@@ -4,7 +4,7 @@ using CRC
 import Base.push!
 
 # Define enumeration for RxStates
-@enum RxStates Hunting_SOT Hunting_EOT Port_Lost Timeout_Error Message_Ready Content_Error CRC_Error Garbage_Error Overrun_Error
+@enum RxStates Hunting_SOT Hunting_EOT Port_Lost Timeout_Error Message_NACK Message_Ready Content_Error CRC_Error Garbage_Error Overrun_Error
 
 # Define message types
 @enum MsgType begin
@@ -46,7 +46,7 @@ function push!(bus::Interbus, data::Vector{UInt8})
 end
 
 function push!(bus::Interbus, data::UInt8)
-    if data in [SOT, EOT, SOE]
+    if data in (SOT, EOT, SOE)
         push!(bus.tx_buffer, SOE)
         data += ECC
     end
@@ -64,7 +64,7 @@ function send!(bus::Interbus, device_id::UInt8, register_id::UInt8, msgType::Msg
     push!(bus, bus.master_id)
     push!(bus, UInt8(msgType))
     push!(bus, register_id)
-    if msgType in [MSG_WRCMD MSG_WRCLR MSG_WRSET MSG_WRTGL]
+    if msgType in (MSG_WRCMD, MSG_WRCLR, MSG_WRSET, MSG_WRTGL)
         push!(bus, data)  # Add write data to message
     end
     crc = bus.crc_func(bus.tx_buffer[2:end])
@@ -72,17 +72,20 @@ function send!(bus::Interbus, device_id::UInt8, register_id::UInt8, msgType::Msg
     push!(bus, UInt8(crc & 0xff))
     push!(bus.tx_buffer, EOT) # End of Telegram
     write(bus.sp, bus.tx_buffer)
+    # println(bytes2hex(bus.tx_buffer)) # DEBUG
 end
 
-function receive!(bus::Interbus, device_id::UInt8, register_id::UInt8, msgType::UInt8)
+function receive!(bus::Interbus, device_id::UInt8, register_id::UInt8, msgType::MsgType)
     payload = UInt8[]
     rxCh::UInt8 = 0
     bus.rx_state = Hunting_SOT
-    while bus.rx_state in [Hunting_SOT, Hunting_EOT]
+    msgType_uint = UInt8(msgType)
+    while bus.rx_state in (Hunting_SOT, Hunting_EOT)
         try
             rxCh = read(bus.sp, UInt8)
+            # print(bytes2hex(rxCh))
         catch error
-            if isa(error, LibSerialPort.Timeout)
+            if error isa LibSerialPort.Timeout || error isa InterruptException
                 bus.rx_state = Timeout_Error
             else
                 bus.rx_state = Port_Lost
@@ -101,10 +104,16 @@ function receive!(bus::Interbus, device_id::UInt8, register_id::UInt8, msgType::
                 if length(bus.rx_buffer) >= 5     # host_id + device_id + msgType + CRCH + CRCL - Minimum telegram length
                     if bus.crc_func(bus.rx_buffer) == 0
                         # We have collected a message with valid CRC - Check the contents
-                        if bus.rx_buffer[2] == device_id && bus.rx_buffer[3] == msgType && bus.rx_buffer[4] == register_id
-                            resize!(payload, length(bus.rx_buffer) - 5)
-                            payload = copy(bus.rx_buffer[5:end-2])
-                            bus.rx_state = Message_Ready
+                        if bus.rx_buffer[2] == device_id && bus.rx_buffer[4] == register_id
+                            if bus.rx_buffer[3] == msgType_uint
+                                resize!(payload, length(bus.rx_buffer) - 5)
+                                payload = copy(bus.rx_buffer[5:end-2])
+                                bus.rx_state = Message_Ready
+                            elseif bus.rx_buffer[3] == 0x00
+                                bus.rx_state = Message_NACK
+                            else
+                                bus.rx_state = Content_Error
+                            end
                         else
                             bus.rx_state = Content_Error
                         end
@@ -133,21 +142,22 @@ function receive!(bus::Interbus, device_id::UInt8, register_id::UInt8, msgType::
     return payload, bus.rx_state
 end
 
-function Base.open(portname::AbstractString, baudrate::Integer, master_id::UInt8, timeout::Real=0.01)
-    sp = LibSerialPort.open(portname, baudrate)
-    set_read_timeout(sp, timeout)
-    set_write_timeout(sp, timeout)
-    return Interbus(sp, master_id)
-end
+# These are not good, they are pirates!
+# function Base.open(portname::AbstractString, baudrate::Integer, master_id::UInt8, timeout::Real=0.01)
+#     sp = LibSerialPort.open(portname, baudrate)
+#     set_read_timeout(sp, timeout)
+#     set_write_timeout(sp, timeout)
+#     return Interbus(sp, master_id)
+# end
 
-function Base.open(f::Function, portname::AbstractString, baudrate::Integer, master_id::UInt8, timeout::Real=0.01)
-    bus = open(portname, baudrate, master_id, timeout)
-    try
-        f(bus)
-    finally
-        close(bus)
-    end
-end
+# function Base.open(f::Function, portname::AbstractString, baudrate::Integer, master_id::UInt8, timeout::Real=0.01)
+#     bus = open(portname, baudrate, master_id, timeout)
+#     try
+#         f(bus)
+#     finally
+#         close(bus)
+#     end
+# end
 
 function Base.close(bus::Interbus)
     if isopen(bus)
@@ -161,9 +171,12 @@ function Base.read(bus::Interbus, device_id, register_id)
     if isopen(bus)
         flush!(bus)
         send!(bus, device_id, register_id, MSG_RDCMD, UInt8[])
-        payload, state = receive!(bus, device_id, register_id, UInt8(MSG_DATAGRAM))
+        payload, state = receive!(bus, device_id, register_id, MSG_DATAGRAM)
         if state == Message_Ready
             return payload
+        else
+            @error "Could not read register" device_id register_id state payload
+            return
         end
     end
 end
@@ -172,21 +185,12 @@ function Base.write(bus::Interbus, device_id, register_id, x)
     if isopen(bus)
         flush!(bus)
         send!(bus, device_id, register_id, MSG_WRCMD, reinterpret(UInt8, x))
-        _, state = receive!(bus, device_id, register_id, UInt8(MSG_ACK))
+        _, state = receive!(bus, device_id, register_id, MSG_ACK)
         if state == Message_Ready
             return true
-        end
-    end
-    return false
-end
-
-function Base.write(bus::Interbus, device_id, register_id, x)
-    if isopen(bus)
-        flush!(bus)
-        send!(bus, device_id, register_id, MSG_WRCMD, reinterpret(UInt8, x))
-        _, state = receive!(bus, device_id, register_id, UInt8(MSG_ACK))
-        if state == Message_Ready
-            return true
+        else
+            @error "Could not read register" device_id register_id state 
+            return
         end
     end
     return false
